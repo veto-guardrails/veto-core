@@ -1,0 +1,40 @@
+# --- secrets / local env ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Go (gateway/) ---
+gateway/veto-gateway
+gateway/*.test
+gateway/coverage.out
+gateway/vendor/
+
+# --- Python (inference/) ---
+inference/.venv/
+inference/__pycache__/
+inference/**/__pycache__/
+inference/*.egg-info/
+inference/.pytest_cache/
+inference/.ruff_cache/
+inference/.mypy_cache/
+*.pyc
+
+# --- ML artifacts (heavy, must not land in git) ---
+inference/models/
+*.onnx
+*.bin
+*.safetensors
+*.pt
+
+# --- Docker / build ---
+**/Dockerfile.local
+.dockerignore.local
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
