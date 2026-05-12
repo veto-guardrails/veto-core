@@ -2,13 +2,18 @@
 .env
 .env.*
 !.env.example
+.envrc
+.direnv/
 *.pem
 *.key
+*.p12
+*.pfx
 
 # --- Go (gateway/) ---
 gateway/veto-gateway
 gateway/*.test
 gateway/coverage.out
+gateway/coverage.html
 gateway/vendor/
 
 # --- Python (inference/) ---
@@ -19,18 +24,39 @@ inference/*.egg-info/
 inference/.pytest_cache/
 inference/.ruff_cache/
 inference/.mypy_cache/
+inference/htmlcov/
+inference/.coverage
+inference/.coverage.*
+inference/coverage.xml
+inference/*.cover
 *.pyc
 
 # --- ML artifacts (heavy, must not land in git) ---
 inference/models/
+models/
+**/.cache/huggingface/
 *.onnx
 *.bin
 *.safetensors
 *.pt
+*.ckpt
+*.h5
+
+# --- Archives / binaries (accidental commits) ---
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.whl
 
 # --- Docker / build ---
 **/Dockerfile.local
 .dockerignore.local
+
+# --- Editor / runtime version files ---
+.python-version
+.tool-versions
+.nvmrc.local
 
 # --- OS / editor ---
 .DS_Store
@@ -38,3 +64,4 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+*.swo

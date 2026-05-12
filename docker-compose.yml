@@ -1,0 +1,30 @@
+services:
+  inference:
+    build: ./inference
+    container_name: veto-inference
+    environment:
+      VETO_INJECTION_MODEL: protectai/deberta-v3-base-prompt-injection-v2
+    expose:
+      - "8000"
+    networks:
+      - veto
+    restart: unless-stopped
+
+  gateway:
+    build: ./gateway
+    container_name: veto-gateway
+    environment:
+      VETO_API_KEY: ${VETO_API_KEY:-vt_test_dev_change_me}
+      VETO_INFERENCE_URL: http://inference:8000
+    depends_on:
+      inference:
+        condition: service_healthy
+    ports:
+      - "${VETO_HOST_PORT:-8088}:8080"
+    networks:
+      - veto
+    restart: unless-stopped
+
+networks:
+  veto:
+    name: veto

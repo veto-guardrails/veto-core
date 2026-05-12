@@ -1,0 +1,23 @@
+[project]
+name = "veto-inference"
+version = "0.1.0"
+description = "Veto inference service — prompt injection / PII / toxicity classifiers."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "fastapi==0.115.4",
+    "uvicorn[standard]==0.32.0",
+    "transformers==4.45.2",
+    "pydantic==2.9.2",
+    "sentencepiece==0.2.0",
+    "protobuf==5.28.2",
+    "tokenizers==0.20.1",
+    "torch==2.4.1",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
