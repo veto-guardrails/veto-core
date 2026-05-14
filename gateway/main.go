@@ -5,7 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -54,12 +54,16 @@ var (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	apiKey = os.Getenv("VETO_API_KEY")
 	if apiKey == "" {
-		log.Fatal("VETO_API_KEY is required")
+		slog.Error("VETO_API_KEY is required")
+		os.Exit(1)
 	}
 	if apiKey == devAPIKey && os.Getenv("VETO_ALLOW_DEV_KEY") != "1" {
-		log.Fatal("VETO_API_KEY is set to the public dev sentinel; set a real key or VETO_ALLOW_DEV_KEY=1 for local dev")
+		slog.Error("VETO_API_KEY is set to the public dev sentinel; set a real key or VETO_ALLOW_DEV_KEY=1 for local dev")
+		os.Exit(1)
 	}
 	inferenceURL = envDefault("VETO_INFERENCE_URL", "http://inference:8000")
 
@@ -87,19 +91,19 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("veto-gateway v0.1 listening on %s, inference=%s", srv.Addr, inferenceURL)
+		slog.Info("listening", "addr", srv.Addr, "inference", inferenceURL)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("listen: %v", err)
+			slog.Error("listen", "err", err)
 			stop()
 		}
 	}()
 
 	<-ctx.Done()
-	log.Print("shutting down")
+	slog.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown: %v", err)
+		slog.Error("shutdown", "err", err)
 	}
 }
 
@@ -117,7 +121,7 @@ func envFloat(k string, d float64) float64 {
 	}
 	f, err := strconv.ParseFloat(v, 64)
 	if err != nil || f <= 0 {
-		log.Printf("invalid %s=%q, using default %v", k, v, d)
+		slog.Warn("invalid env, using default", "key", k, "got", v, "default", d)
 		return d
 	}
 	return f
@@ -186,7 +190,7 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 			f, err := detectInjection(ctx, req.Text)
 			cancel()
 			if err != nil {
-				log.Printf("inference error: %v", err)
+				slog.WarnContext(r.Context(), "inference", "err", err)
 			} else {
 				findings = append(findings, f...)
 			}
