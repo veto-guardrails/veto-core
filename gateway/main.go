@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -12,6 +13,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
+
+// devAPIKey is the sentinel shipped in compose defaults and docs. Refuse to
+// boot in prod if VETO_API_KEY is empty or matches this value — a missing env
+// shouldn't silently grant a known-public bypass.
+const devAPIKey = "vt_test_dev_change_me"
 
 type CheckRequest struct {
 	Text       string   `json:"text"`
@@ -44,7 +50,13 @@ var (
 )
 
 func main() {
-	apiKey = envDefault("VETO_API_KEY", "vt_test_dev_change_me")
+	apiKey = os.Getenv("VETO_API_KEY")
+	if apiKey == "" {
+		log.Fatal("VETO_API_KEY is required")
+	}
+	if apiKey == devAPIKey && os.Getenv("VETO_ALLOW_DEV_KEY") != "1" {
+		log.Fatal("VETO_API_KEY is set to the public dev sentinel; set a real key or VETO_ALLOW_DEV_KEY=1 for local dev")
+	}
 	inferenceURL = envDefault("VETO_INFERENCE_URL", "http://inference:8000")
 
 	r := chi.NewRouter()
@@ -70,12 +82,20 @@ func envDefault(k, d string) string {
 }
 
 func auth(next http.HandlerFunc) http.HandlerFunc {
+	want := []byte(apiKey)
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-Veto-Key")
 		if key == "" {
 			key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		}
-		if key == "" || key != apiKey {
+		// subtle.ConstantTimeCompare returns 0 if lengths differ — pad to avoid
+		// leaking the configured key length to a network attacker probing
+		// timing differences on a public surface.
+		got := []byte(key)
+		if len(got) != len(want) {
+			got = make([]byte, len(want))
+		}
+		if subtle.ConstantTimeCompare(got, want) != 1 || key == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
