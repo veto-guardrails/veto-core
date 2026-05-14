@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,8 +67,12 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(10 * time.Second))
 
+	rps := envFloat("VETO_RATE_RPS", 1.0)   // 60 req/min steady-state
+	burst := envFloat("VETO_RATE_BURST", 20) // short spike tolerance
+	limiter := newIPLimiter(rps, burst)
+
 	r.Get("/healthz", healthz)
-	r.Post("/v1/check", auth(handleCheck))
+	r.Post("/v1/check", rateLimit(limiter)(auth(handleCheck)))
 
 	addr := ":8080"
 	log.Printf("veto-gateway v0.1 listening on %s, inference=%s", addr, inferenceURL)
@@ -79,6 +84,19 @@ func envDefault(k, d string) string {
 		return v
 	}
 	return d
+}
+
+func envFloat(k string, d float64) float64 {
+	v := os.Getenv(k)
+	if v == "" {
+		return d
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 {
+		log.Printf("invalid %s=%q, using default %v", k, v, d)
+		return d
+	}
+	return f
 }
 
 func auth(next http.HandlerFunc) http.HandlerFunc {
