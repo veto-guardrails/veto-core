@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"sync"
@@ -28,14 +29,14 @@ type ipLimiter struct {
 	buckets  map[string]*bucket
 }
 
-func newIPLimiter(rps, burst float64) *ipLimiter {
+func newIPLimiter(ctx context.Context, rps, burst float64) *ipLimiter {
 	l := &ipLimiter{
 		rps:     rps,
 		burst:   burst,
 		idleTTL: 10 * time.Minute,
 		buckets: make(map[string]*bucket),
 	}
-	go l.gcLoop()
+	go l.gcLoop(ctx)
 	return l
 }
 
@@ -61,17 +62,23 @@ func (l *ipLimiter) allow(key string, now time.Time) bool {
 	return true
 }
 
-func (l *ipLimiter) gcLoop() {
+func (l *ipLimiter) gcLoop(ctx context.Context) {
 	t := time.NewTicker(l.idleTTL)
-	for range t.C {
-		cutoff := time.Now().Add(-l.idleTTL)
-		l.mu.Lock()
-		for k, b := range l.buckets {
-			if b.last.Before(cutoff) {
-				delete(l.buckets, k)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			cutoff := time.Now().Add(-l.idleTTL)
+			l.mu.Lock()
+			for k, b := range l.buckets {
+				if b.last.Before(cutoff) {
+					delete(l.buckets, k)
+				}
 			}
+			l.mu.Unlock()
 		}
-		l.mu.Unlock()
 	}
 }
 

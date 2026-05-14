@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 type inferReq struct {
@@ -17,7 +18,17 @@ type inferResp struct {
 	Label     string  `json:"label"`
 }
 
-var inferClient = &http.Client{}
+// inferClient — defense-in-depth on top of the per-call context timeout.
+// Bounds total request duration and idle keepalive lifetime so a misbehaving
+// inference service can't starve the gateway of connections.
+var inferClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        16,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     30 * time.Second,
+	},
+}
 
 func detectInjection(ctx context.Context, text string) ([]Finding, error) {
 	body, _ := json.Marshal(inferReq{Text: text})

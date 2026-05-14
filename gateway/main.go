@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -60,6 +63,9 @@ func main() {
 	}
 	inferenceURL = envDefault("VETO_INFERENCE_URL", "http://inference:8000")
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -69,14 +75,32 @@ func main() {
 
 	rps := envFloat("VETO_RATE_RPS", 1.0)   // 60 req/min steady-state
 	burst := envFloat("VETO_RATE_BURST", 20) // short spike tolerance
-	limiter := newIPLimiter(rps, burst)
+	limiter := newIPLimiter(ctx, rps, burst)
 
 	r.Get("/healthz", healthz)
 	r.Post("/v1/check", rateLimit(limiter)(auth(handleCheck)))
 
-	addr := ":8080"
-	log.Printf("veto-gateway v0.1 listening on %s, inference=%s", addr, inferenceURL)
-	log.Fatal(http.ListenAndServe(addr, r))
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		log.Printf("veto-gateway v0.1 listening on %s, inference=%s", srv.Addr, inferenceURL)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("listen: %v", err)
+			stop()
+		}
+	}()
+
+	<-ctx.Done()
+	log.Print("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: %v", err)
+	}
 }
 
 func envDefault(k, d string) string {
