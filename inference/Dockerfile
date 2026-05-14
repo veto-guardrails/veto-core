@@ -14,18 +14,22 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 10001 -r -d /app -s /usr/sbin/nologin veto \
+    && mkdir -p /models \
+    && chown -R veto:veto /app /models
 
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-install-project
+COPY --chown=veto:veto pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project && chown -R veto:veto /app/.venv
 
 ARG INJECTION_MODEL=protectai/deberta-v3-base-prompt-injection-v2
 ENV VETO_INJECTION_MODEL=${INJECTION_MODEL}
+USER veto
 RUN python -c "from transformers import AutoTokenizer, AutoModelForSequenceClassification; \
     AutoTokenizer.from_pretrained('${INJECTION_MODEL}'); \
     AutoModelForSequenceClassification.from_pretrained('${INJECTION_MODEL}')"
 
-COPY app.py .
+COPY --chown=veto:veto app.py .
 
 EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=10 \
