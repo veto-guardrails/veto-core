@@ -1,6 +1,9 @@
 package main
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 type patternRule struct {
 	name     string
@@ -60,7 +63,13 @@ func scanCategory(text, category string) ([]Finding, string) {
 		if rule.category != category {
 			continue
 		}
+		// Single pass: capture each match's bounds *and* emit the replacement
+		// in one walk. Indices refer to the pre-redaction `redacted` string,
+		// matching the contract the previous two-pass version exposed.
 		matches := rule.re.FindAllStringIndex(redacted, -1)
+		if len(matches) == 0 {
+			continue
+		}
 		for _, m := range matches {
 			findings = append(findings, Finding{
 				Category: rule.category,
@@ -71,9 +80,16 @@ func scanCategory(text, category string) ([]Finding, string) {
 				End:      m[1],
 			})
 		}
-		if len(matches) > 0 {
-			redacted = rule.re.ReplaceAllString(redacted, rule.replace)
+		var b strings.Builder
+		b.Grow(len(redacted))
+		prev := 0
+		for _, m := range matches {
+			b.WriteString(redacted[prev:m[0]])
+			b.WriteString(rule.replace)
+			prev = m[1]
 		}
+		b.WriteString(redacted[prev:])
+		redacted = b.String()
 	}
 	return findings, redacted
 }

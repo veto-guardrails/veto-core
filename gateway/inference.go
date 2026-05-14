@@ -31,7 +31,10 @@ var inferClient = &http.Client{
 }
 
 func detectInjection(ctx context.Context, text string) ([]Finding, error) {
-	body, _ := json.Marshal(inferReq{Text: text})
+	body, err := json.Marshal(inferReq{Text: text})
+	if err != nil {
+		return nil, fmt.Errorf("marshal infer req: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", inferenceURL+"/detect/injection", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
