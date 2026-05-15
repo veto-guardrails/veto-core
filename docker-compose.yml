@@ -13,9 +13,15 @@ services:
   gateway:
     build: ./gateway
     container_name: veto-gateway
+    # Gateway resolves customer keys against cloud + Redis. This compose only
+    # ships gateway + inference; bring up veto-cloud's deploy/docker-compose
+    # for the cloud and redis services on the shared `veto` network, or point
+    # these URLs at your own deployment.
     environment:
-      VETO_API_KEY: ${VETO_API_KEY:-vt_test_dev_change_me}
       VETO_INFERENCE_URL: http://inference:8000
+      VETO_REDIS_URL: ${VETO_REDIS_URL:-redis://redis:6379/0}
+      VETO_CLOUD_URL: ${VETO_CLOUD_URL:-http://cloud:8090}
+      VETO_CLOUD_INTERNAL_TOKEN: ${VETO_CLOUD_INTERNAL_TOKEN:?set VETO_CLOUD_INTERNAL_TOKEN in .env}
     depends_on:
       inference:
         condition: service_healthy

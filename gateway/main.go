@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -17,11 +16,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
-
-// devAPIKey is the sentinel shipped in compose defaults and docs. Refuse to
-// boot in prod if VETO_API_KEY is empty or matches this value — a missing env
-// shouldn't silently grant a known-public bypass.
-const devAPIKey = "vt_test_dev_change_me"
 
 type CheckRequest struct {
 	Text       string   `json:"text"`
@@ -48,27 +42,26 @@ type CheckResponse struct {
 
 const maxBodyBytes = 64 * 1024
 
-var (
-	apiKey       string
-	inferenceURL string
-)
+var inferenceURL string
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	apiKey = os.Getenv("VETO_API_KEY")
-	if apiKey == "" {
-		slog.Error("VETO_API_KEY is required")
-		os.Exit(1)
-	}
-	if apiKey == devAPIKey && os.Getenv("VETO_ALLOW_DEV_KEY") != "1" {
-		slog.Error("VETO_API_KEY is set to the public dev sentinel; set a real key or VETO_ALLOW_DEV_KEY=1 for local dev")
-		os.Exit(1)
-	}
 	inferenceURL = envDefault("VETO_INFERENCE_URL", "http://inference:8000")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	lookup, err := newLookup(
+		os.Getenv("VETO_REDIS_URL"),
+		os.Getenv("VETO_CLOUD_URL"),
+		os.Getenv("VETO_CLOUD_INTERNAL_TOKEN"),
+	)
+	if err != nil {
+		slog.Error("key lookup init", "err", err)
+		os.Exit(1)
+	}
+	defer lookup.Close()
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -82,7 +75,7 @@ func main() {
 	limiter := newIPLimiter(ctx, rps, burst)
 
 	r.Get("/healthz", healthz)
-	r.Post("/v1/check", rateLimit(limiter)(auth(handleCheck)))
+	r.Post("/v1/check", rateLimit(limiter)(auth(lookup, handleCheck)))
 
 	srv := &http.Server{
 		Addr:              ":8080",
@@ -127,25 +120,63 @@ func envFloat(k string, d float64) float64 {
 	return f
 }
 
-func auth(next http.HandlerFunc) http.HandlerFunc {
-	want := []byte(apiKey)
+type ctxKey int
+
+const ctxKeyEntry ctxKey = 1
+
+func entryFromCtx(ctx context.Context) (Entry, bool) {
+	e, ok := ctx.Value(ctxKeyEntry).(Entry)
+	return e, ok
+}
+
+// auth validates the presented customer key end-to-end: parse → resolve
+// (Redis → cloud RPC) → argon2id verify. On success the resolved Entry is
+// attached to the request context so downstream handlers (metering, future
+// per-org rate-limit) can read org/project/tier without re-querying.
+//
+// argon2id runs once per request here; Lot D layers an LRU on top so a hot
+// key amortizes the ~50ms hash to one verify per minute.
+func auth(lookup *Lookup, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-Veto-Key")
 		if key == "" {
 			key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		}
-		// subtle.ConstantTimeCompare returns 0 if lengths differ — pad to avoid
-		// leaking the configured key length to a network attacker probing
-		// timing differences on a public surface.
-		got := []byte(key)
-		if len(got) != len(want) {
-			got = make([]byte, len(want))
-		}
-		if subtle.ConstantTimeCompare(got, want) != 1 || key == "" {
+		prefix, last4, ok := parseAPIKey(key)
+		if !ok {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
-		next(w, r)
+
+		lookupCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		entry, err := lookup.Resolve(lookupCtx, prefix, last4)
+		if errors.Is(err, ErrKeyNotFound) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		if err != nil {
+			slog.WarnContext(r.Context(), "key lookup", "err", err, "prefix", prefix, "last4", last4)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "auth backend unavailable"})
+			return
+		}
+
+		match, vErr := argonVerify(key, entry.HashArgon2id)
+		if vErr != nil {
+			slog.ErrorContext(r.Context(), "argon verify", "err", vErr, "key_id", entry.KeyID)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "auth check failed"})
+			return
+		}
+		if !match {
+			// last4 collision is the only way to land here for a well-formed
+			// key; the verify catches it. Log so we can spot abuse patterns.
+			slog.InfoContext(r.Context(), "key argon mismatch", "prefix", prefix, "last4", last4)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), ctxKeyEntry, entry)
+		next(w, r.WithContext(ctx))
 	}
 }
 
