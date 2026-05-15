@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -u
-KEY="${VETO_API_KEY:-vt_test_dev_change_me}"
+KEY="${VETO_API_KEY:-}"
 URL="${VETO_URL:-http://localhost:8080}"
+if [ -z "$KEY" ]; then
+  echo "VETO_API_KEY required — mint a vt_live_… key from the dashboard" >&2
+  exit 1
+fi
 
 call() {
   local label="$1" payload="$2"
