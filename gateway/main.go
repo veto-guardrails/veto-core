@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -64,6 +65,14 @@ func main() {
 	defer lookup.Close()
 	verified := newVerifiedCache()
 
+	metering, err := newMetering(os.Getenv("VETO_REDIS_URL"), envDefault("VETO_REGION", "single"))
+	if err != nil {
+		slog.Error("metering init", "err", err)
+		os.Exit(1)
+	}
+	defer metering.Close()
+	go metering.Run(ctx)
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -76,7 +85,7 @@ func main() {
 	limiter := newIPLimiter(ctx, rps, burst)
 
 	r.Get("/healthz", healthz)
-	r.Post("/v1/check", rateLimit(limiter)(auth(lookup, verified, handleCheck)))
+	r.Post("/v1/check", rateLimit(limiter)(auth(lookup, verified, handleCheck(metering))))
 
 	srv := &http.Server{
 		Addr:              ":8080",
@@ -191,71 +200,148 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func handleCheck(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+func handleCheck(metering *Metering) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 
-	var req CheckRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	if strings.TrimSpace(req.Text) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text required"})
-		return
-	}
+		// Read the body whole so we can attribute byte_count_in to the
+		// metering event. Bodies are capped at 64 KiB above; the alloc is
+		// bounded.
+		raw, rerr := io.ReadAll(r.Body)
+		if rerr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "read body"})
+			return
+		}
+		bytesIn := len(raw)
 
-	cats := req.Categories
-	if len(cats) == 0 {
-		cats = []string{"pii", "secrets", "injection"}
-	}
+		var req CheckRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if strings.TrimSpace(req.Text) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text required"})
+			return
+		}
 
-	findings := []Finding{}
-	redacted := req.Text
+		cats := req.Categories
+		if len(cats) == 0 {
+			cats = []string{"pii", "secrets", "injection"}
+		}
 
-	for _, c := range cats {
-		switch c {
-		case "pii":
-			f, red := scanCategory(redacted, "pii")
-			findings = append(findings, f...)
-			redacted = red
-		case "secrets":
-			f, red := scanCategory(redacted, "secrets")
-			findings = append(findings, f...)
-			redacted = red
-		case "injection":
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-			f, err := detectInjection(ctx, req.Text)
-			cancel()
-			if err != nil {
-				slog.WarnContext(r.Context(), "inference", "err", err)
-			} else {
+		findings := []Finding{}
+		redacted := req.Text
+		var inferenceDur time.Duration
+
+		for _, c := range cats {
+			switch c {
+			case "pii":
+				f, red := scanCategory(redacted, "pii")
 				findings = append(findings, f...)
+				redacted = red
+			case "secrets":
+				f, red := scanCategory(redacted, "secrets")
+				findings = append(findings, f...)
+				redacted = red
+			case "injection":
+				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				f, dur, err := detectInjection(ctx, req.Text)
+				cancel()
+				inferenceDur += dur
+				if err != nil {
+					slog.WarnContext(r.Context(), "inference", "err", err)
+				} else {
+					findings = append(findings, f...)
+				}
 			}
 		}
-	}
 
-	action := "allow"
-	allowed := true
-	for _, f := range findings {
-		if f.Severity == "high" {
-			action = "block"
-			allowed = false
-			break
+		action := "allow"
+		allowed := true
+		for _, f := range findings {
+			if f.Severity == "high" {
+				action = "block"
+				allowed = false
+				break
+			}
+			if (f.Category == "pii" || f.Category == "secrets") && action == "allow" {
+				action = "redact"
+			}
 		}
-		if (f.Category == "pii" || f.Category == "secrets") && action == "allow" {
-			action = "redact"
-		}
-	}
 
-	resp := CheckResponse{
-		Allowed:   allowed,
-		Action:    action,
-		Findings:  findings,
-		Redacted:  redacted,
-		LatencyMs: float64(time.Since(start).Microseconds()) / 1000.0,
+		resp := CheckResponse{
+			Allowed:   allowed,
+			Action:    action,
+			Findings:  findings,
+			Redacted:  redacted,
+			LatencyMs: float64(time.Since(start).Microseconds()) / 1000.0,
+		}
+
+		// Marshal first so we can attribute byte_count_out to the event,
+		// then write. writeJSON is bypassed here because we need the size.
+		body, mErr := json.Marshal(resp)
+		if mErr != nil {
+			slog.ErrorContext(r.Context(), "marshal response", "err", mErr)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "encode failed"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		bytesOut, _ := w.Write(body)
+
+		entry, ok := entryFromCtx(r.Context())
+		if !ok {
+			// Should never happen — auth() always attaches Entry on success.
+			// If it does, the request was somehow let through without auth;
+			// log loud and skip the emit (we have no org to attribute to).
+			slog.ErrorContext(r.Context(), "metering: no entry in context — skipping emit")
+			return
+		}
+		metering.Emit(Event{
+			OrgID:       entry.OrgID,
+			ProjectID:   entry.ProjectID,
+			KeyID:       entry.KeyID,
+			Action:      action,
+			Categories:  findingCategories(findings),
+			Rules:       findingRules(findings),
+			LatencyMs:   resp.LatencyMs,
+			InferenceMs: float64(inferenceDur.Microseconds()) / 1000.0,
+			Status:      http.StatusOK,
+			BytesIn:     bytesIn,
+			BytesOut:    bytesOut,
+		})
 	}
-	writeJSON(w, http.StatusOK, resp)
+}
+
+// findingCategories deduplicates the category set across findings — kept
+// small (3 categories today) so a slice is fine.
+func findingCategories(fs []Finding) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(fs))
+	for _, f := range fs {
+		if _, dup := seen[f.Category]; dup {
+			continue
+		}
+		seen[f.Category] = struct{}{}
+		out = append(out, f.Category)
+	}
+	return out
+}
+
+// findingRules deduplicates the rule set; cardinality bounded by the rule
+// catalog (~20).
+func findingRules(fs []Finding) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(fs))
+	for _, f := range fs {
+		if _, dup := seen[f.Rule]; dup {
+			continue
+		}
+		seen[f.Rule] = struct{}{}
+		out = append(out, f.Rule)
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
