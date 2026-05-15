@@ -84,9 +84,11 @@ VETO_HOST_PORT=18088 docker compose up -d --build
 ## Smoke test
 
 ```bash
-bash scripts/test.sh
-# or against a non-default URL/key:
-VETO_URL=http://localhost:18088 VETO_API_KEY=vt_test_dev_change_me bash scripts/test.sh
+# VETO_API_KEY is required — there's no dev-sentinel fallback. Mint a real
+# vt_live_… key from the dashboard first.
+VETO_API_KEY=vt_live_… bash scripts/test.sh
+# or against a non-default URL:
+VETO_URL=http://localhost:18088 VETO_API_KEY=vt_live_… bash scripts/test.sh
 ```
 
 A 9-call matrix against `POST /v1/check`:
@@ -110,14 +112,16 @@ Pipe through `| jq .` to pretty-print, or comment that out at the top of `script
 
 | Variable | Default | Service | Purpose |
 |---|---|---|---|
-| `VETO_API_KEY` | `vt_test_dev_change_me` | gateway | Dev key for `X-Veto-Key` auth |
+| `VETO_REDIS_URL` | — (required) | gateway | Hot-path key cache (cloud writes, gateway reads) |
+| `VETO_CLOUD_URL` | — (required) | gateway | Control-plane base URL for the cache-miss key lookup |
+| `VETO_CLOUD_INTERNAL_TOKEN` | — (required) | gateway | Bearer for the internal cloud RPC (matches `veto-cloud`'s token) |
 | `VETO_HOST_PORT` | `8088` | compose | Host-side port for gateway |
 | `VETO_INFERENCE_URL` | `http://inference:8000` | gateway | Base URL for ML classifier |
 | `VETO_INJECTION_MODEL` | `protectai/deberta-v3-base-prompt-injection-v2` | inference | HuggingFace model id |
 | `VETO_MAX_LEN` | `512` | inference | Tokenizer max length |
 | `HF_HOME` | `/models` | inference | HuggingFace cache (baked into image at build) |
 
-The API key is read **server-side only**. The browser never sees it.
+The API key (a real `vt_live_…` minted from the dashboard) is sent by the caller as `X-Veto-Key` and never logged.
 
 ---
 
@@ -126,7 +130,7 @@ The API key is read **server-side only**. The browser never sees it.
 This repo is the prototype shape. Items on the roadmap that haven't landed:
 
 - **Hyperscan** multi-pattern regex (RE2 stdlib only today).
-- **Redis-backed auth, rate-limit, metering.** Single env-var key only.
+- **Redis-backed per-org rate-limit + metering.** Customer-key auth is wired (Redis + cloud RPC + argon2id, in-process LRU on top); rate-limit is still per-IP only and metering events aren't emitted yet.
 - **Streaming guardrails** — `/v1/check` is request/response only.
 - **Proxy mode** — `base_url`-swap for OpenAI/Anthropic/etc. transparent forwarding.
 - **gRPC** gateway↔inference (HTTP/JSON today).

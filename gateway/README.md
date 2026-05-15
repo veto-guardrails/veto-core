@@ -38,13 +38,15 @@ The gateway depends on the inference service being **healthy** (compose `depends
 
 ```bash
 cd gateway
-VETO_API_KEY=vt_test_dev_change_me \
+VETO_REDIS_URL=redis://localhost:6379/0 \
+VETO_CLOUD_URL=http://localhost:8090 \
+VETO_CLOUD_INTERNAL_TOKEN=<32+ chars matching the cloud's token> \
 VETO_INFERENCE_URL=http://localhost:8000 \
 go run .
 # Listens on :8080
 ```
 
-You'll need the inference service running separately, or expect `injection` checks to fail with a logged `inference error:` (the gateway still returns a 200 with regex findings — fail-open by design at this layer).
+You'll need the inference service AND `veto-cloud` + Redis running separately. The gateway resolves customer keys against cloud + Redis on every request — there is no shared bypass key. Mint a real `vt_live_…` from the dashboard and pass it as `X-Veto-Key`.
 
 ### Standalone Docker
 
@@ -52,7 +54,9 @@ You'll need the inference service running separately, or expect `injection` chec
 cd gateway
 docker build -t veto-gateway .
 docker run --rm -p 8088:8080 \
-  -e VETO_API_KEY=vt_test_dev_change_me \
+  -e VETO_REDIS_URL=redis://host.docker.internal:6379/0 \
+  -e VETO_CLOUD_URL=http://host.docker.internal:8090 \
+  -e VETO_CLOUD_INTERNAL_TOKEN=… \
   -e VETO_INFERENCE_URL=http://host.docker.internal:8000 \
   veto-gateway
 ```
@@ -177,7 +181,9 @@ The gateway thresholds at:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `VETO_API_KEY` | `vt_test_dev_change_me` | Single accepted value for `X-Veto-Key` / `Authorization: Bearer` |
+| `VETO_REDIS_URL` | — (required) | Hot-path key cache. URL form (`redis://host:port/db`). Cloud is the writer; gateway reads. |
+| `VETO_CLOUD_URL` | — (required) | Base URL for the cloud control plane. Used as the cache-miss fallback at `…/internal/v1/keys/lookup`. |
+| `VETO_CLOUD_INTERNAL_TOKEN` | — (required) | Bearer token matching cloud's `VETO_CLOUD_INTERNAL_TOKEN`. Min 32 chars. |
 | `VETO_INFERENCE_URL` | `http://inference:8000` | Base URL for the inference service |
 
 Listen address is hard-coded to `:8080` inside the container; the host-side port mapping is configured in `docker-compose.yml` (default `8088:8080`, overridable via `VETO_HOST_PORT`).
@@ -188,15 +194,18 @@ Listen address is hard-coded to `:8080` inside the container; the host-side port
 
 ```
 gateway/
-├── go.mod                 module + chi dep
-├── main.go                router, middleware, /healthz, /v1/check handler
+├── go.mod                 module + chi / redis / argon2 / lru deps
+├── main.go                router, middleware, /healthz, /v1/check handler, auth()
+├── keylookup.go           Lookup (Redis → cloud RPC), parseAPIKey, argonVerify
+├── cache.go               verifiedCache — sha256-keyed LRU on top of Lookup
 ├── rules.go               regex rule table + scanCategory()
+├── ratelimit.go           per-IP token bucket (interim — per-key replaces it)
 ├── inference.go           HTTP client → POST /detect/injection
 ├── Dockerfile             go build → distroless
 └── README.md              ← this file
 ```
 
-No `internal/` packages, no test files yet — the whole service fits in three `.go` files. When that stops being true, introduce `internal/{auth,rules,inference}` and add table-driven unit tests for `scanCategory`.
+No test files yet. When the package grows past these files, split into `internal/{auth,rules,inference}` and add table-driven unit tests for `scanCategory` + a property test for `argonVerify` round-tripping cloud's mint format.
 
 ---
 
@@ -209,10 +218,21 @@ HTTP request
 chi middleware: RequestID · RealIP · Logger · Recoverer · Timeout(10s)
    │
    ▼
+rateLimit (per-IP token bucket, interim)
+   │
+   ▼
 auth() middleware
    │
    │   X-Veto-Key or Authorization: Bearer
-   │   constant-time check against VETO_API_KEY
+   │   1. verifiedCache.Get(sha256(key)) ── hit ──▶ attach Entry to ctx, next
+   │   2. parseAPIKey → prefix + last4
+   │   3. Lookup.Resolve:
+   │        Redis GET veto:key:<prefix><last4>
+   │        ├── hit  → JSON unmarshal Entry
+   │        └── miss → cloud RPC GET /internal/v1/keys/lookup (bearer)
+   │   4. argonVerify(key, Entry.HashArgon2id)
+   │   5. verifiedCache.Put(key, Entry)
+   │   6. attach Entry to ctx
    │
    ▼
 handleCheck()
@@ -256,7 +276,7 @@ Adding e.g. toxicity:
 
 ### A new auth scheme
 
-The current `auth()` middleware is a string compare against `VETO_API_KEY`. For per-tenant lookups, replace the body of `auth()` with a Redis fetch keyed by `argon2id(key)`. Don't put that lookup in the handler — middleware is the right boundary.
+`auth()` already does a per-tenant lookup (verified-key LRU → Redis → cloud RPC → argon2id). To add a *different* scheme (mTLS, JWT, OAuth introspection), keep the lookup chain — the verified-key LRU is the right place to short-circuit any successful auth — and add a parallel verifier before `parseAPIKey`. Don't put auth logic in the handler.
 
 ---
 
@@ -287,7 +307,8 @@ Then switch the Dockerfile builder step from `RUN go mod tidy && CGO_ENABLED=0 g
 Tracked here so the reader doesn't expect SPEC features that haven't been wired:
 
 - **Hyperscan.** Intel Hyperscan for multi-pattern matching on x86, with RE2 as the ARM fallback. Today it's RE2 only (Go stdlib).
-- **Redis-backed auth / rate-limit / metering.** Currently a single env-var key, no rate-limiting, no metering.
+- **Per-key / per-org rate-limit.** Per-IP token bucket only today. Per-org budgets land with the metering pipeline (same Redis instance the cache lives on).
+- **Metering.** Gateway resolves `(org_id, project_id, tier)` per request but does not yet emit usage events. Next slice — see `veto-docs/PLAN.md` §3.
 - **Proxy mode.** Transparent forwarding to OpenAI/Anthropic/etc. via `base_url` swap. Not wired — only the REST `/v1/check` mode exists.
 - **Streaming.** Pre-check on streamed chunks + injected control frames (`event: veto.block`) — not yet.
 - **gRPC to inference.** Today the gateway → inference link is HTTP/JSON. Production target is gRPC + protobuf.
