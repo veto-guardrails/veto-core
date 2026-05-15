@@ -62,6 +62,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer lookup.Close()
+	verified := newVerifiedCache()
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -75,7 +76,7 @@ func main() {
 	limiter := newIPLimiter(ctx, rps, burst)
 
 	r.Get("/healthz", healthz)
-	r.Post("/v1/check", rateLimit(limiter)(auth(lookup, handleCheck)))
+	r.Post("/v1/check", rateLimit(limiter)(auth(lookup, verified, handleCheck)))
 
 	srv := &http.Server{
 		Addr:              ":8080",
@@ -134,13 +135,19 @@ func entryFromCtx(ctx context.Context) (Entry, bool) {
 // attached to the request context so downstream handlers (metering, future
 // per-org rate-limit) can read org/project/tier without re-querying.
 //
-// argon2id runs once per request here; Lot D layers an LRU on top so a hot
-// key amortizes the ~50ms hash to one verify per minute.
-func auth(lookup *Lookup, next http.HandlerFunc) http.HandlerFunc {
+// A verified-key LRU sits in front: a hit (within TTL) skips both the lookup
+// chain and argon2id, so a hot key amortizes the ~50ms hash to one verify
+// per minute. Cache lookup is keyed by sha256(plaintext) — last4 collisions
+// can't promote one customer's request into another's session.
+func auth(lookup *Lookup, verified *verifiedCache, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-Veto-Key")
 		if key == "" {
 			key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		}
+		if entry, ok := verified.Get(key); ok {
+			next(w, r.WithContext(context.WithValue(r.Context(), ctxKeyEntry, entry)))
+			return
 		}
 		prefix, last4, ok := parseAPIKey(key)
 		if !ok {
@@ -175,8 +182,8 @@ func auth(lookup *Lookup, next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), ctxKeyEntry, entry)
-		next(w, r.WithContext(ctx))
+		verified.Put(key, entry)
+		next(w, r.WithContext(context.WithValue(r.Context(), ctxKeyEntry, entry)))
 	}
 }
 
