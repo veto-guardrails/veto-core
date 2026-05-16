@@ -33,13 +33,21 @@ const last4Len = 4
 var ErrKeyNotFound = errors.New("key not found")
 
 // Entry is the gateway's view of a resolved API key. Mirrors cloud's
-// keycache.Entry / dbgen.LookupAPIKeyRow.
+// keycache.Entry — must stay in lockstep (struct + JSON tags).
+//
+// CurrentPeriodStart is unix-seconds of the org's current billing-period
+// start (Stripe period for Pro/Enterprise, synthetic anniversary for Free).
+// Used as the namespace component of the rate-limit Redis key so the
+// counter resets on period rollover. May lag by ≤60 s past rollover (LRU
+// cache TTL); a Free user at cap sees up to ~60 s of stale 429s until the
+// next cache miss + lookup heals.
 type Entry struct {
-	KeyID        string `json:"key_id"`
-	ProjectID    string `json:"project_id"`
-	OrgID        string `json:"org_id"`
-	Tier         string `json:"tier"`
-	HashArgon2id string `json:"hash_argon2id"`
+	KeyID              string `json:"key_id"`
+	ProjectID          string `json:"project_id"`
+	OrgID              string `json:"org_id"`
+	Tier               string `json:"tier"`
+	HashArgon2id       string `json:"hash_argon2id"`
+	CurrentPeriodStart int64  `json:"current_period_start"`
 }
 
 // Lookup resolves customer keys: Redis cache first, cloud RPC on miss. No

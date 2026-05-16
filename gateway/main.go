@@ -73,6 +73,13 @@ func main() {
 	defer metering.Close()
 	go metering.Run(ctx)
 
+	orgRL, err := newOrgRateLimiter(os.Getenv("VETO_REDIS_URL"))
+	if err != nil {
+		slog.Error("org rate limiter init", "err", err)
+		os.Exit(1)
+	}
+	defer orgRL.Close()
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -85,7 +92,12 @@ func main() {
 	limiter := newIPLimiter(ctx, rps, burst)
 
 	r.Get("/healthz", healthz)
-	r.Post("/v1/check", rateLimit(limiter)(auth(lookup, verified, handleCheck(metering))))
+	// Middleware order matters:
+	//   rateLimit (per-IP)  → cheap, sheds obvious abuse before auth
+	//   auth                → resolves Entry into ctx (org_id, tier, period)
+	//   orgRateLimit        → per-org cap check, needs Entry
+	//   handleCheck         → actual work + metering emit
+	r.Post("/v1/check", rateLimit(limiter)(auth(lookup, verified, orgRateLimit(orgRL, handleCheck(metering)))))
 
 	srv := &http.Server{
 		Addr:              ":8080",
