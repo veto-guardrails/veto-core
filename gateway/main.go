@@ -265,11 +265,38 @@ func handleCheck(metering *Metering) http.HandlerFunc {
 		start := time.Now()
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 
+		// emitError fires a metering event for an error path so analytics
+		// rollups still account for the request (operator sees error rate
+		// per org). Action prefix "error_" tells the aggregator to count
+		// the row in usage_rollups_actions but skip the billing UPSERT
+		// and the findings/rules/latency rollups (no findings, and
+		// timeout-skewed latency would distort customer p99 panels).
+		emitError := func(status, bytesIn int) {
+			entry, ok := entryFromCtx(r.Context())
+			if !ok {
+				return
+			}
+			action := "error_4xx"
+			if status >= 500 {
+				action = "error_5xx"
+			}
+			metering.Emit(Event{
+				OrgID:     entry.OrgID,
+				ProjectID: entry.ProjectID,
+				KeyID:     entry.KeyID,
+				Action:    action,
+				LatencyMs: float64(time.Since(start).Microseconds()) / 1000.0,
+				Status:    status,
+				BytesIn:   bytesIn,
+			})
+		}
+
 		// Read the body whole so we can attribute byte_count_in to the
 		// metering event. Bodies are capped at 64 KiB above; the alloc is
 		// bounded.
 		raw, rerr := io.ReadAll(r.Body)
 		if rerr != nil {
+			emitError(http.StatusBadRequest, 0)
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "read body"})
 			return
 		}
@@ -277,10 +304,12 @@ func handleCheck(metering *Metering) http.HandlerFunc {
 
 		var req CheckRequest
 		if err := json.Unmarshal(raw, &req); err != nil {
+			emitError(http.StatusBadRequest, bytesIn)
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
 		if strings.TrimSpace(req.Text) == "" {
+			emitError(http.StatusBadRequest, bytesIn)
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text required"})
 			return
 		}
@@ -343,6 +372,7 @@ func handleCheck(metering *Metering) http.HandlerFunc {
 		body, mErr := json.Marshal(resp)
 		if mErr != nil {
 			slog.ErrorContext(r.Context(), "marshal response", "err", mErr)
+			emitError(http.StatusInternalServerError, bytesIn)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "encode failed"})
 			return
 		}

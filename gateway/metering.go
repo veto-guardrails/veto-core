@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -28,6 +29,11 @@ const queueCapacity = 4096
 // xaddTimeout — Redis call must finish quickly; a stalled Redis cannot be
 // allowed to back up the worker indefinitely.
 const xaddTimeout = 1 * time.Second
+
+// statsInterval — how often the worker logs cumulative drop count. Non-zero
+// drops mean the worker can't keep up with /v1/check throughput; surfacing
+// it makes the alert path "grep for non-zero in journald".
+const statsInterval = 60 * time.Second
 
 // Event mirrors SPEC §4.14's normative collected-fields list. Anything not
 // on that list does not get emitted — no prompt text, no redacted output,
@@ -63,6 +69,10 @@ type Metering struct {
 	rdb    *redis.Client
 	region string
 	ch     chan Event
+	// drops is the cumulative count of events dropped because the queue
+	// was full. Bumped in Emit; logged by statsLoop. A non-zero rate is
+	// a sign the worker can't keep up — the bills are being undercounted.
+	drops atomic.Int64
 }
 
 // newMetering opens its OWN Redis connection — separate from Lookup's so
@@ -102,9 +112,19 @@ func (m *Metering) Emit(e Event) {
 	select {
 	case m.ch <- e:
 	default:
+		m.drops.Add(1)
 		slog.Warn("metering queue full — event dropped",
 			"org_id", e.OrgID, "queue_cap", queueCapacity)
 	}
+}
+
+// Drops returns the cumulative count of events dropped because the queue
+// was full. Exposed for tests; statsLoop logs the value periodically.
+func (m *Metering) Drops() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.drops.Load()
 }
 
 // Run pulls events from the queue and XADDs them. Drains the queue on ctx
@@ -114,6 +134,7 @@ func (m *Metering) Run(ctx context.Context) {
 	if m == nil {
 		return
 	}
+	go m.statsLoop(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -121,6 +142,29 @@ func (m *Metering) Run(ctx context.Context) {
 			return
 		case e := <-m.ch:
 			m.publish(ctx, e)
+		}
+	}
+}
+
+// statsLoop emits one slog line per statsInterval reporting the cumulative
+// drop count plus the delta vs the previous tick. Quiet when the system is
+// healthy (delta=0 lines are suppressed) so a non-zero line is the alert
+// signal — easy to grep / route to Slack.
+func (m *Metering) statsLoop(ctx context.Context) {
+	t := time.NewTicker(statsInterval)
+	defer t.Stop()
+	prev := int64(0)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			cur := m.drops.Load()
+			delta := cur - prev
+			prev = cur
+			if delta > 0 {
+				slog.Warn("metering drops", "total", cur, "delta", delta, "queue_cap", queueCapacity)
+			}
 		}
 	}
 }
