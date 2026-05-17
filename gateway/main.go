@@ -39,6 +39,13 @@ type CheckResponse struct {
 	Findings  []Finding `json:"findings"`
 	Redacted  string    `json:"redacted,omitempty"`
 	LatencyMs float64   `json:"latency_ms"`
+	// Degraded names guardrail categories that failed open during this
+	// request — typically `injection` when the ML inference service is
+	// unreachable or timed out. Customers should treat findings for
+	// those categories as missing rather than absent. Empty / omitted
+	// means every requested category ran successfully. SPEC §1 (radical
+	// transparency): we tell customers what we couldn't check.
+	Degraded []string `json:"degraded,omitempty"`
 }
 
 const maxBodyBytes = 64 * 1024
@@ -322,6 +329,7 @@ func handleCheck(metering *Metering) http.HandlerFunc {
 		findings := []Finding{}
 		redacted := req.Text
 		var inferenceDur time.Duration
+		var degraded []string
 
 		for _, c := range cats {
 			switch c {
@@ -340,6 +348,7 @@ func handleCheck(metering *Metering) http.HandlerFunc {
 				inferenceDur += dur
 				if err != nil {
 					slog.WarnContext(r.Context(), "inference", "err", err)
+					degraded = append(degraded, "injection")
 				} else {
 					findings = append(findings, f...)
 				}
@@ -365,6 +374,7 @@ func handleCheck(metering *Metering) http.HandlerFunc {
 			Findings:  findings,
 			Redacted:  redacted,
 			LatencyMs: float64(time.Since(start).Microseconds()) / 1000.0,
+			Degraded:  degraded,
 		}
 
 		// Marshal first so we can attribute byte_count_out to the event,
