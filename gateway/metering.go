@@ -39,11 +39,24 @@ type Event struct {
 	Action      string
 	Categories  []string
 	Rules       []string
+	// Pairs is the (rule, category) tuples that fired, deduped on Rule.
+	// Equivalent in content to (Rules, Categories) but preserves the
+	// rule→category mapping the analytics rollup needs.
+	Pairs       []FindingPair
 	LatencyMs   float64
 	InferenceMs float64
 	Status      int
 	BytesIn     int
 	BytesOut    int
+}
+
+// FindingPair is one (rule, category) tuple. Encoded on the wire as
+// "rule:category"; the aggregator splits on the first colon. Rule and
+// category names are constrained to the catalog (rules.go), neither
+// contains ':' or ',' so no escaping is needed.
+type FindingPair struct {
+	Rule     string
+	Category string
 }
 
 type Metering struct {
@@ -121,6 +134,10 @@ func (m *Metering) drain() {
 func (m *Metering) publish(parent context.Context, e Event) {
 	ctx, cancel := context.WithTimeout(parent, xaddTimeout)
 	defer cancel()
+	pairs := make([]string, 0, len(e.Pairs))
+	for _, p := range e.Pairs {
+		pairs = append(pairs, p.Rule+":"+p.Category)
+	}
 	args := &redis.XAddArgs{
 		Stream: streamKey,
 		MaxLen: streamMaxLen,
@@ -132,6 +149,7 @@ func (m *Metering) publish(parent context.Context, e Event) {
 			"action":             e.Action,
 			"finding_categories": strings.Join(e.Categories, ","),
 			"finding_rules":      strings.Join(e.Rules, ","),
+			"finding_rule_pairs": strings.Join(pairs, ","),
 			"latency_ms":         strconv.FormatFloat(e.LatencyMs, 'f', 3, 64),
 			"inference_ms":       strconv.FormatFloat(e.InferenceMs, 'f', 3, 64),
 			"region":             m.region,

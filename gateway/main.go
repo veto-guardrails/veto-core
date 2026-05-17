@@ -317,6 +317,7 @@ func handleCheck(metering *Metering) http.HandlerFunc {
 			Action:      action,
 			Categories:  findingCategories(findings),
 			Rules:       findingRules(findings),
+			Pairs:       findingPairs(findings),
 			LatencyMs:   resp.LatencyMs,
 			InferenceMs: float64(inferenceDur.Microseconds()) / 1000.0,
 			Status:      http.StatusOK,
@@ -352,6 +353,23 @@ func findingRules(fs []Finding) []string {
 		}
 		seen[f.Rule] = struct{}{}
 		out = append(out, f.Rule)
+	}
+	return out
+}
+
+// findingPairs deduplicates (rule, category) pairs on rule name, keeping
+// the first occurrence's category. The analytics rollup needs the
+// rule→category mapping inline so the aggregator doesn't have to know the
+// rule catalog (which lives in this repo, not in veto-cloud).
+func findingPairs(fs []Finding) []FindingPair {
+	seen := map[string]struct{}{}
+	out := make([]FindingPair, 0, len(fs))
+	for _, f := range fs {
+		if _, dup := seen[f.Rule]; dup {
+			continue
+		}
+		seen[f.Rule] = struct{}{}
+		out = append(out, FindingPair{Rule: f.Rule, Category: f.Category})
 	}
 	return out
 }
