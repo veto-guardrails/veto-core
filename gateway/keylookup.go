@@ -141,8 +141,11 @@ func parseAPIKey(k string) (prefix, last4 string, ok bool) {
 
 // argonVerify recomputes argon2id with the parameters embedded in the stored
 // PHC string, then constant-time compares. Returns false (no error) on
-// mismatch; only returns error on malformed PHC (a corruption bug, not user
-// input).
+// mismatch; returns error on malformed PHC OR on parameters weaker than
+// the cross-repo floor (config.MinArgon2id*). The floor check makes a
+// downgrade attack — where a compromised mint path produces deliberately
+// weak hashes — fail loud at the verify boundary, instead of silently
+// auth'ing.
 func argonVerify(plaintext, phc string) (bool, error) {
 	parts := strings.Split(phc, "$")
 	// Expect: ["", "argon2id", "v=19", "m=…,t=…,p=…", "<salt>", "<key>"]
@@ -156,6 +159,10 @@ func argonVerify(plaintext, phc string) (bool, error) {
 	var p uint8
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &m, &t, &p); err != nil {
 		return false, fmt.Errorf("parse argon params: %w", err)
+	}
+	if m < config.MinArgon2idMemoryKiB || t < config.MinArgon2idTime || p < config.MinArgon2idThreads {
+		return false, fmt.Errorf("argon params below floor: got m=%d t=%d p=%d, min m=%d t=%d p=%d",
+			m, t, p, config.MinArgon2idMemoryKiB, config.MinArgon2idTime, config.MinArgon2idThreads)
 	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
 	if err != nil {
