@@ -53,32 +53,62 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	lookup, err := newLookup(
-		os.Getenv("VETO_REDIS_URL"),
-		os.Getenv("VETO_CLOUD_URL"),
-		os.Getenv("VETO_CLOUD_INTERNAL_TOKEN"),
-	)
+	// Static-key mode: when VETO_STATIC_KEYS is set, the gateway resolves
+	// keys from the env var and skips the cloud RPC entirely. Lets the OSS
+	// gateway run standalone without veto-cloud. Redis + metering stay
+	// optional in this mode — they're only wired if VETO_REDIS_URL is set.
+	staticKeys, err := parseStaticKeys(os.Getenv("VETO_STATIC_KEYS"))
 	if err != nil {
-		slog.Error("key lookup init", "err", err)
+		slog.Error("parse VETO_STATIC_KEYS", "err", err)
 		os.Exit(1)
 	}
-	defer lookup.Close()
+	staticMode := len(staticKeys) > 0
+	if staticMode {
+		slog.Info("static-key mode", "keys", len(staticKeys))
+	}
+
+	var lookup *Lookup
+	if !staticMode {
+		lookup, err = newLookup(
+			os.Getenv("VETO_REDIS_URL"),
+			os.Getenv("VETO_CLOUD_URL"),
+			os.Getenv("VETO_CLOUD_INTERNAL_TOKEN"),
+		)
+		if err != nil {
+			slog.Error("key lookup init", "err", err)
+			os.Exit(1)
+		}
+		defer lookup.Close()
+	}
 	verified := newVerifiedCache()
 
-	metering, err := newMetering(os.Getenv("VETO_REDIS_URL"), envDefault("VETO_REGION", "single"))
-	if err != nil {
-		slog.Error("metering init", "err", err)
-		os.Exit(1)
-	}
-	defer metering.Close()
-	go metering.Run(ctx)
+	redisURL := os.Getenv("VETO_REDIS_URL")
+	var metering *Metering
+	var orgRL *OrgRateLimiter
+	if redisURL != "" {
+		metering, err = newMetering(redisURL, envDefault("VETO_REGION", "single"))
+		if err != nil {
+			slog.Error("metering init", "err", err)
+			os.Exit(1)
+		}
+		defer metering.Close()
+		go metering.Run(ctx)
 
-	orgRL, err := newOrgRateLimiter(os.Getenv("VETO_REDIS_URL"))
-	if err != nil {
-		slog.Error("org rate limiter init", "err", err)
+		orgRL, err = newOrgRateLimiter(redisURL)
+		if err != nil {
+			slog.Error("org rate limiter init", "err", err)
+			os.Exit(1)
+		}
+		defer orgRL.Close()
+	} else if !staticMode {
+		// Dynamic mode without Redis would silently disable metering AND
+		// can't even cache key lookups — fail loud at boot rather than
+		// surprise operators in prod.
+		slog.Error("VETO_REDIS_URL required in dynamic mode (omit it only when VETO_STATIC_KEYS is set)")
 		os.Exit(1)
+	} else {
+		slog.Info("running without Redis (static-key mode) — metering + rate-limit disabled")
 	}
-	defer orgRL.Close()
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -97,7 +127,7 @@ func main() {
 	//   auth                → resolves Entry into ctx (org_id, tier, period)
 	//   orgRateLimit        → per-org cap check, needs Entry
 	//   handleCheck         → actual work + metering emit
-	r.Post("/v1/check", rateLimit(limiter)(auth(lookup, verified, orgRateLimit(orgRL, handleCheck(metering)))))
+	r.Post("/v1/check", rateLimit(limiter)(auth(lookup, verified, staticKeys, orgRateLimit(orgRL, handleCheck(metering)))))
 
 	srv := &http.Server{
 		Addr:              ":8080",
@@ -151,21 +181,39 @@ func entryFromCtx(ctx context.Context) (Entry, bool) {
 	return e, ok
 }
 
-// auth validates the presented customer key end-to-end: parse → resolve
-// (Redis → cloud RPC) → argon2id verify. On success the resolved Entry is
-// attached to the request context so downstream handlers (metering, future
-// per-org rate-limit) can read org/project/tier without re-querying.
+// auth validates the presented customer key end-to-end. Two modes:
 //
-// A verified-key LRU sits in front: a hit (within TTL) skips both the lookup
-// chain and argon2id, so a hot key amortizes the ~50ms hash to one verify
-// per minute. Cache lookup is keyed by sha256(plaintext) — last4 collisions
-// can't promote one customer's request into another's session.
-func auth(lookup *Lookup, verified *verifiedCache, next http.HandlerFunc) http.HandlerFunc {
+//  1. Static mode (VETO_STATIC_KEYS set): the env-var map is the source
+//     of truth. A presented key is either in the map (allowed) or not
+//     (unauthorized) — no Redis, no cloud, no argon2id.
+//  2. Dynamic mode (default): parse → resolve (Redis → cloud RPC) →
+//     argon2id verify. A verified-key LRU sits in front: a hit (within
+//     TTL) skips both the lookup chain and argon2id, so a hot key
+//     amortizes the ~50 ms hash to one verify per minute. Cache lookup
+//     is keyed by sha256(plaintext) — last4 collisions can't promote
+//     one customer's request into another's session.
+//
+// On success the resolved Entry is attached to the request context so
+// downstream handlers (metering, per-org rate-limit) can read
+// org/project/tier without re-querying.
+func auth(lookup *Lookup, verified *verifiedCache, staticKeys map[string]Entry, next http.HandlerFunc) http.HandlerFunc {
+	staticMode := len(staticKeys) > 0
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-Veto-Key")
 		if key == "" {
 			key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		}
+
+		if staticMode {
+			entry, ok := staticKeys[key]
+			if !ok {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+				return
+			}
+			next(w, r.WithContext(context.WithValue(r.Context(), ctxKeyEntry, entry)))
+			return
+		}
+
 		if entry, ok := verified.Get(key); ok {
 			next(w, r.WithContext(context.WithValue(r.Context(), ctxKeyEntry, entry)))
 			return

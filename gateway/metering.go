@@ -93,8 +93,12 @@ func newMetering(redisURL, region string) (*Metering, error) {
 
 // Emit hands the event to the worker. Non-blocking: drops on full queue
 // rather than slow down /v1/check. A persistent drop pattern means the
-// worker can't keep up with Redis — alert on it.
+// worker can't keep up with Redis — alert on it. Nil receiver is a no-op:
+// the OSS standalone path (static keys, no Redis) has no Metering at all.
 func (m *Metering) Emit(e Event) {
+	if m == nil {
+		return
+	}
 	select {
 	case m.ch <- e:
 	default:
@@ -105,8 +109,11 @@ func (m *Metering) Emit(e Event) {
 
 // Run pulls events from the queue and XADDs them. Drains the queue on ctx
 // done so a graceful shutdown doesn't lose the last few events that handlers
-// already stuffed into the channel.
+// already stuffed into the channel. Nil receiver is a no-op.
 func (m *Metering) Run(ctx context.Context) {
+	if m == nil {
+		return
+	}
 	for {
 		select {
 		case <-ctx.Done():
