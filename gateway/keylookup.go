@@ -12,12 +12,9 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/veto-guardrails/veto-core/config"
 	"golang.org/x/crypto/argon2"
 )
-
-// keyCachePrefix mirrors the namespace cloud writes under (see veto-cloud's
-// internal/keycache). Keep both sides in lockstep.
-const keyCachePrefix = "veto:key:"
 
 // keyPrefixLive is the only prefix accepted at v1. vt_test_ is reserved.
 const keyPrefixLive = "vt_live_"
@@ -32,23 +29,12 @@ const last4Len = 4
 // ErrKeyNotFound — the supplied key has no active row in cloud's api_keys.
 var ErrKeyNotFound = errors.New("key not found")
 
-// Entry is the gateway's view of a resolved API key. Mirrors cloud's
-// keycache.Entry — must stay in lockstep (struct + JSON tags).
-//
-// CurrentPeriodStart is unix-seconds of the org's current billing-period
-// start (Stripe period for Pro/Enterprise, synthetic anniversary for Free).
-// Used as the namespace component of the rate-limit Redis key so the
-// counter resets on period rollover. May lag by ≤60 s past rollover (LRU
-// cache TTL); a Free user at cap sees up to ~60 s of stale 429s until the
-// next cache miss + lookup heals.
-type Entry struct {
-	KeyID              string `json:"key_id"`
-	ProjectID          string `json:"project_id"`
-	OrgID              string `json:"org_id"`
-	Tier               string `json:"tier"`
-	HashArgon2id       string `json:"hash_argon2id"`
-	CurrentPeriodStart int64  `json:"current_period_start"`
-}
+// Entry is a local alias for the cross-repo cache wire format defined in
+// veto-core/config. Aliasing (not redefining) so the gateway and cloud
+// can never disagree on the JSON shape — the struct lives once, in
+// config.KeyCacheEntry. Existing call-sites continue using the short
+// `Entry` name.
+type Entry = config.KeyCacheEntry
 
 // Lookup resolves customer keys: Redis cache first, cloud RPC on miss. No
 // LRU yet — Lot D layers an in-process cache on top so argon2id verification
@@ -107,7 +93,7 @@ func (l *Lookup) Close() error {
 // Order: Redis GET → cloud RPC fallback → ErrKeyNotFound. Redis transport
 // errors fall through to RPC so a Redis blip can't lock customers out.
 func (l *Lookup) Resolve(ctx context.Context, prefix, last4 string) (Entry, error) {
-	val, err := l.rdb.Get(ctx, keyCachePrefix+prefix+last4).Bytes()
+	val, err := l.rdb.Get(ctx, config.KeyCachePrefix+prefix+last4).Bytes()
 	if err == nil {
 		var e Entry
 		if jerr := json.Unmarshal(val, &e); jerr == nil {
