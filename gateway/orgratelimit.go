@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/veto-guardrails/veto-core/config"
 )
 
 // Per-org rate-limiting on the hot path.
@@ -21,14 +22,9 @@ import (
 // Redis key namespace can carry "displayed usage vs Stripe billing" sanity
 // checks if we ever need them.
 //
-// Tier limits mirror veto-cloud/internal/server/me_usage.go and SPEC §6.
-// Keep both sides in lockstep; the dashboard panel and this enforcer must
-// always agree on what "the limit" is.
-const (
-	freeMonthlyLimit int64 = 10_000
-	proIncludedLimit int64 = 100_000 // soft target, not enforced; tracked only
-	rlKeyPrefix            = "veto:rate:"
-)
+// Tier limits are sourced from veto-core/config/tiers.json — the single
+// cross-repo truth. Gateway, cloud, and web all read the same file.
+const rlKeyPrefix = "veto:rate:"
 
 // rateLimitOpTimeout — each Redis op (INCR / EXPIRE) is short; cap so a
 // stalled Redis can't pin a request handler.
@@ -116,14 +112,11 @@ func (rl *OrgRateLimiter) CheckAndIncrement(ctx context.Context, orgID, tier str
 }
 
 // limitForTier returns the hard cap (>0) for tiers we enforce. 0 means
-// "no hard cap" (Pro, Enterprise, or unknown — fail-open).
+// "no hard cap" (Pro, Enterprise, or unknown — fail-open). Sources from
+// the cross-repo config so the dashboard and the enforcer can never
+// disagree on "the limit".
 func limitForTier(tier string) int64 {
-	switch tier {
-	case "free":
-		return freeMonthlyLimit
-	default:
-		return 0
-	}
+	return config.LimitForTier(tier)
 }
 
 // orgRateLimit is the middleware. Must run AFTER auth so the resolved
