@@ -11,7 +11,9 @@ services:
     restart: unless-stopped
 
   gateway:
-    build: ./gateway
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
     container_name: veto-gateway
     # Gateway resolves customer keys against cloud + Redis. This compose only
     # ships gateway + inference; bring up veto-cloud's deploy/docker-compose

@@ -52,7 +52,11 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./${{ matrix.service }}
+          # Gateway build needs sibling config/ visible (../config replace in
+          # go.mod), so its context is the repo root. Inference is self-
+          # contained — its context is its own subdir.
+          context: ${{ matrix.service == 'gateway' && '.' || format('./{0}', matrix.service) }}
+          file: ${{ matrix.service == 'gateway' && './gateway/Dockerfile' || format('./{0}/Dockerfile', matrix.service) }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
