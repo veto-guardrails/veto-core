@@ -21,9 +21,15 @@ services:
     # these URLs at your own deployment.
     environment:
       VETO_INFERENCE_URL: http://inference:8000
-      VETO_REDIS_URL: ${VETO_REDIS_URL:-redis://redis:6379/0}
-      VETO_CLOUD_URL: ${VETO_CLOUD_URL:-http://cloud:8090}
-      VETO_CLOUD_INTERNAL_TOKEN: ${VETO_CLOUD_INTERNAL_TOKEN:?set VETO_CLOUD_INTERNAL_TOKEN in .env}
+      # All three control-plane env vars are optional. The gateway enforces
+      # them at boot when VETO_STATIC_KEYS is empty (managed mode); when
+      # VETO_STATIC_KEYS is set, the gateway runs standalone and these go
+      # unused. Compose can't conditionally require them, so we let the Go
+      # code be the source of truth and use `:-` (empty default) here.
+      VETO_REDIS_URL: ${VETO_REDIS_URL:-}
+      VETO_CLOUD_URL: ${VETO_CLOUD_URL:-}
+      VETO_CLOUD_INTERNAL_TOKEN: ${VETO_CLOUD_INTERNAL_TOKEN:-}
+      VETO_STATIC_KEYS: ${VETO_STATIC_KEYS:-}
     depends_on:
       inference:
         condition: service_healthy
