@@ -4,20 +4,23 @@
     "monthly_requests_limit": 10000,
     "monthly_requests_included": 10000,
     "base_price_eur": 0,
-    "overage_per_million_eur": null
+    "overage_per_million_eur": null,
+    "rollups_retention_days": 30
   },
   "pro": {
     "name": "Pro",
     "monthly_requests_limit": null,
     "monthly_requests_included": 100000,
     "base_price_eur": 19,
-    "overage_per_million_eur": 1.50
+    "overage_per_million_eur": 1.50,
+    "rollups_retention_days": 90
   },
   "enterprise": {
     "name": "Enterprise",
     "monthly_requests_limit": null,
     "monthly_requests_included": null,
     "base_price_eur": null,
-    "overage_per_million_eur": null
+    "overage_per_million_eur": null,
+    "rollups_retention_days": 365
   }
 }

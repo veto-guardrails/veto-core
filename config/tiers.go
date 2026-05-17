@@ -21,14 +21,20 @@ import (
 var tiersJSON []byte
 
 // Tier carries the per-plan numbers used at the gateway, the dashboard,
-// and (in spirit) the Stripe price configuration. Nullable fields use
-// pointers so JSON null is distinguishable from 0.
+// the analytics-rollups retention cron, and (in spirit) the Stripe price
+// configuration. Nullable fields use pointers so JSON null is
+// distinguishable from 0.
 type Tier struct {
-	Name                   string   `json:"name"`
-	MonthlyRequestsLimit   *int64   `json:"monthly_requests_limit"`
+	Name                    string   `json:"name"`
+	MonthlyRequestsLimit    *int64   `json:"monthly_requests_limit"`
 	MonthlyRequestsIncluded *int64   `json:"monthly_requests_included"`
-	BasePriceEUR           *float64 `json:"base_price_eur"`
-	OveragePerMillionEUR   *float64 `json:"overage_per_million_eur"`
+	BasePriceEUR            *float64 `json:"base_price_eur"`
+	OveragePerMillionEUR    *float64 `json:"overage_per_million_eur"`
+	// RollupsRetentionDays — how long usage_rollups_* rows are kept for
+	// this tier. SPEC §4.14 retention matrix. The cron in veto-cloud
+	// reads this; 0 / missing means "keep forever" (not used today —
+	// every shipping tier has an explicit value).
+	RollupsRetentionDays int `json:"rollups_retention_days"`
 }
 
 var tiers map[string]Tier
@@ -93,4 +99,11 @@ func IncludedQuotaForTier(tier string) int64 {
 		return 0
 	}
 	return *t.MonthlyRequestsIncluded
+}
+
+// RetentionDaysForTier returns how many days of usage_rollups_* rows to
+// keep for a given tier. 0 means "keep forever" — used by the retention
+// cron in veto-cloud as the cutoff = now - N days.
+func RetentionDaysForTier(tier string) int {
+	return tiers[tier].RollupsRetentionDays
 }
