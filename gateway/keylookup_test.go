@@ -72,8 +72,14 @@ func TestArgonVerify_FloorRejectsWeakHash(t *testing.T) {
 
 func TestArgonVerify_FloorRejectsLowTime(t *testing.T) {
 	plaintext := "vt_live_abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqr"
-	// Time cost of 0 — not a real argon value, but tests the floor.
-	weak := makeHash(plaintext, config.MinArgon2idMemoryKiB, 0, config.MinArgon2idThreads)
+	// argon2.IDKey panics on t=0 ("number of rounds too small"), so we
+	// hand-construct a PHC string claiming t=0 instead of running makeHash.
+	// argonVerify rejects on the floor check (line 163) before re-computing
+	// argon2id, so the salt/key bodies don't need to be meaningful.
+	weak := "$argon2id$v=19$m=" + itoa(int(config.MinArgon2idMemoryKiB)) +
+		",t=0,p=" + itoa(int(config.MinArgon2idThreads)) +
+		"$MDEyMzQ1Njc4OWFiY2RlZg" + // base64("0123456789abcdef")
+		"$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" // 32 zero bytes
 
 	_, err := argonVerify(plaintext, weak)
 	if err == nil {

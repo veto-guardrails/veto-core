@@ -8,7 +8,7 @@ import (
 // validKey is a properly formatted vt_live_… plaintext (8-char prefix + 52
 // base32 chars = 60 chars total). Real keys are 32 random bytes base32'd,
 // but parseAPIKey only checks length + prefix.
-const validKey = "vt_live_abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqr"
+const validKey = "vt_live_abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst"
 
 func TestParseStaticKeys_Empty(t *testing.T) {
 	out, err := parseStaticKeys("")
@@ -48,7 +48,7 @@ func TestParseStaticKeys_Single(t *testing.T) {
 }
 
 func TestParseStaticKeys_Multiple(t *testing.T) {
-	key2 := "vt_live_zyxwvutsrqponmlkjihgfedcba234567abcdefghijklmnopqr"
+	key2 := "vt_live_zyxwvutsrqponmlkjihgfedcba234567abcdefghijklmnopqrst"
 	raw := validKey + ":alice-org:free, " + key2 + " :bob-org:pro"
 	out, err := parseStaticKeys(raw)
 	if err != nil {
@@ -83,8 +83,8 @@ func TestParseStaticKeys_BadPrefix(t *testing.T) {
 	// key shape — `sk_live_` would trip GitHub's Stripe secret scanner on
 	// push protection, even though this is a negative-test fixture.
 	cases := []string{
-		"xx_live_abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqr:org:free", // wrong prefix
-		"vt_test_abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqr:org:free", // vt_test_ reserved
+		"xx_live_abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst:org:free", // wrong prefix
+		"vt_test_abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst:org:free", // vt_test_ reserved
 		"vt_live_short:org:free",                                              // too short
 	}
 	for _, raw := range cases {
