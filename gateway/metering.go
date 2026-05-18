@@ -30,9 +30,10 @@ const queueCapacity = 4096
 // allowed to back up the worker indefinitely.
 const xaddTimeout = 1 * time.Second
 
-// statsInterval — how often the worker logs cumulative drop count. Non-zero
-// drops mean the worker can't keep up with /v1/check throughput; surfacing
-// it makes the alert path "grep for non-zero in journald".
+// statsInterval — how often the worker logs cumulative drop counts. Non-zero
+// drops mean either the worker can't keep up (queueDrops) or Redis XADD is
+// failing (xaddDrops). Surfacing both makes the alert path "grep for non-zero
+// in journald" and the kind of drop tells the operator where to look.
 const statsInterval = 60 * time.Second
 
 // Event mirrors SPEC §4.14's normative collected-fields list. Anything not
@@ -69,10 +70,16 @@ type Metering struct {
 	rdb    *redis.Client
 	region string
 	ch     chan Event
-	// drops is the cumulative count of events dropped because the queue
-	// was full. Bumped in Emit; logged by statsLoop. A non-zero rate is
-	// a sign the worker can't keep up — the bills are being undercounted.
-	drops atomic.Int64
+	// queueDrops is cumulative events dropped because the in-process queue
+	// was full — bumped in Emit. Non-zero means the worker can't keep up
+	// with /v1/check throughput; bills are being undercounted.
+	queueDrops atomic.Int64
+	// xaddDrops is cumulative events dropped because the Redis XADD failed
+	// after the event was already dequeued — bumped in publish. Non-zero
+	// means Redis is unreachable or rejecting writes; bills are being
+	// undercounted. Different remediation than queueDrops (Redis-side
+	// vs worker-side), so tracked separately.
+	xaddDrops atomic.Int64
 }
 
 // newMetering opens its OWN Redis connection — separate from Lookup's so
@@ -112,19 +119,29 @@ func (m *Metering) Emit(e Event) {
 	select {
 	case m.ch <- e:
 	default:
-		m.drops.Add(1)
+		m.queueDrops.Add(1)
 		slog.Warn("metering queue full — event dropped",
 			"org_id", e.OrgID, "queue_cap", queueCapacity)
 	}
 }
 
-// Drops returns the cumulative count of events dropped because the queue
-// was full. Exposed for tests; statsLoop logs the value periodically.
-func (m *Metering) Drops() int64 {
+// QueueDrops returns the cumulative count of events dropped because the
+// in-process queue was full. Exposed for tests; statsLoop logs periodically.
+func (m *Metering) QueueDrops() int64 {
 	if m == nil {
 		return 0
 	}
-	return m.drops.Load()
+	return m.queueDrops.Load()
+}
+
+// XAddDrops returns the cumulative count of events dropped because the
+// Redis XADD failed after dequeue. Exposed for tests; statsLoop logs
+// periodically.
+func (m *Metering) XAddDrops() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.xaddDrops.Load()
 }
 
 // Run pulls events from the queue and XADDs them. Drains the queue on ctx
@@ -146,25 +163,31 @@ func (m *Metering) Run(ctx context.Context) {
 	}
 }
 
-// statsLoop emits one slog line per statsInterval reporting the cumulative
-// drop count plus the delta vs the previous tick. Quiet when the system is
-// healthy (delta=0 lines are suppressed) so a non-zero line is the alert
-// signal — easy to grep / route to Slack.
+// statsLoop emits one slog line per statsInterval per non-zero counter
+// delta. Quiet when the system is healthy (delta=0 ticks are suppressed)
+// so a non-zero line is the alert signal — easy to grep / route to Slack.
+// Two counters tracked independently: queue-full and XADD-failure.
 func (m *Metering) statsLoop(ctx context.Context) {
 	t := time.NewTicker(statsInterval)
 	defer t.Stop()
-	prev := int64(0)
+	prevQueue := int64(0)
+	prevXadd := int64(0)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			cur := m.drops.Load()
-			delta := cur - prev
-			prev = cur
-			if delta > 0 {
-				slog.Warn("metering drops", "total", cur, "delta", delta, "queue_cap", queueCapacity)
+			curQueue := m.queueDrops.Load()
+			if d := curQueue - prevQueue; d > 0 {
+				slog.Warn("metering drops", "kind", "queue_full", "total", curQueue, "delta", d, "queue_cap", queueCapacity)
 			}
+			prevQueue = curQueue
+
+			curXadd := m.xaddDrops.Load()
+			if d := curXadd - prevXadd; d > 0 {
+				slog.Warn("metering drops", "kind", "xadd_failed", "total", curXadd, "delta", d)
+			}
+			prevXadd = curXadd
 		}
 	}
 }
@@ -210,6 +233,10 @@ func (m *Metering) publish(parent context.Context, e Event) {
 		},
 	}
 	if err := m.rdb.XAdd(ctx, args).Err(); err != nil {
+		// Event already left the queue; XADD failure means the event is
+		// gone. Bump the dedicated counter so statsLoop can surface
+		// Redis-side loss separately from queue-full loss.
+		m.xaddDrops.Add(1)
 		slog.WarnContext(ctx, "metering xadd", "err", err, "org_id", e.OrgID)
 	}
 }
